@@ -120,14 +120,32 @@ func (s *Session) deactivateSOL(ctx context.Context) error {
 	return err
 }
 
-// readLoop reads SOL data from BMC
+// readLoop reads SOL data from BMC as fast as possible
 func (s *Session) readLoop() {
 	defer close(s.readCh)
+
+	// Internal queue for bursty traffic - read fast, drain separately
+	queue := make(chan []byte, 10000)
+	done := make(chan struct{})
+
+	// Goroutine to drain queue to readCh
+	go func() {
+		defer close(done)
+		for data := range queue {
+			select {
+			case s.readCh <- data:
+			case <-s.done:
+				return
+			}
+		}
+	}()
 
 	buf := make([]byte, 1024)
 	for {
 		select {
 		case <-s.done:
+			close(queue)
+			<-done
 			return
 		default:
 		}
@@ -143,6 +161,8 @@ func (s *Session) readLoop() {
 			case s.errCh <- err:
 			default:
 			}
+			close(queue)
+			<-done
 			return
 		}
 
@@ -157,10 +177,10 @@ func (s *Session) readLoop() {
 			continue // Not SOL data
 		}
 
-		// Extract SOL data
-		// Session header ends at offset 16, SOL header is 4 bytes
-		if n < 20 {
-			continue
+		// Get payload length from session header (offset 14-15, little endian)
+		payloadLen := int(binary.LittleEndian.Uint16(buf[14:16]))
+		if payloadLen < 4 || 16+payloadLen > n {
+			continue // Invalid payload length
 		}
 
 		header := parseSolHeader(buf[16:20])
@@ -176,19 +196,21 @@ func (s *Session) readLoop() {
 		s.ackSeqNum = header.PacketSeq
 		s.mu.Unlock()
 
-		// Extract character data
-		dataLen := n - 20
+		// Extract character data (payload minus 4-byte SOL header)
+		dataLen := payloadLen - 4
 		if dataLen > 0 {
 			data := make([]byte, dataLen)
-			copy(data, buf[20:n])
+			copy(data, buf[20:20+dataLen])
 
-			// Send ACK
+			// Send ACK immediately
 			s.sendSolAck()
 
+			// Queue data - never block the read loop
 			select {
-			case s.readCh <- data:
+			case queue <- data:
 			default:
-				// Channel full, drop data
+				// Queue full - this shouldn't happen with 10000 buffer
+				// but if it does, we still don't block
 			}
 		} else if header.PacketSeq != 0 {
 			// ACK-only packet from BMC, send our ACK

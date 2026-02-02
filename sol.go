@@ -69,7 +69,7 @@ func New(cfg Config) *Session {
 		port:     cfg.Port,
 		username: cfg.Username,
 		password: cfg.Password,
-		readCh:   make(chan []byte, 100),
+		readCh:   make(chan []byte, 1000),
 		writeCh:  make(chan []byte, 100),
 		errCh:    make(chan error, 1),
 		done:     make(chan struct{}),
