@@ -21,14 +21,15 @@ type Session struct {
 	password string
 
 	// RMCP+ session state
-	sessionID      uint32
+	sessionID       uint32
 	remoteSessionID uint32
-	authAlg        uint8
-	integrityAlg   uint8
-	cryptoAlg      uint8
-	sik            []byte // Session Integrity Key
-	k1             []byte // Integrity key
-	k2             []byte // Encryption key
+	sessionSeq      uint32 // Session sequence number
+	authAlg         uint8
+	integrityAlg    uint8
+	cryptoAlg       uint8
+	sik             []byte // Session Integrity Key
+	k1              []byte // Integrity key
+	k2              []byte // Encryption key
 
 	// SOL state
 	solPayloadInstance uint8

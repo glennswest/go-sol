@@ -82,8 +82,25 @@ func (h rmcpHeader) pack() []byte {
 	return []byte{h.Version, h.Reserved, h.Sequence, h.Class}
 }
 
-// ipmiSessionHeader is the IPMI session header for RMCP+
-type ipmiSessionHeader struct {
+// ipmi15SessionHeader is the IPMI 1.5 session header (for pre-session messages)
+type ipmi15SessionHeader struct {
+	AuthType   uint8
+	Sequence   uint32
+	SessionID  uint32
+	PayloadLen uint8
+}
+
+func (h ipmi15SessionHeader) pack() []byte {
+	buf := make([]byte, 10)
+	buf[0] = h.AuthType
+	binary.LittleEndian.PutUint32(buf[1:5], h.Sequence)
+	binary.LittleEndian.PutUint32(buf[5:9], h.SessionID)
+	buf[9] = h.PayloadLen
+	return buf
+}
+
+// ipmi20SessionHeader is the IPMI 2.0/RMCP+ session header
+type ipmi20SessionHeader struct {
 	AuthType    uint8
 	PayloadType uint8 // Includes encrypted/authenticated bits
 	SessionID   uint32
@@ -91,7 +108,7 @@ type ipmiSessionHeader struct {
 	PayloadLen  uint16
 }
 
-func (h ipmiSessionHeader) pack() []byte {
+func (h ipmi20SessionHeader) pack() []byte {
 	buf := make([]byte, 12)
 	buf[0] = h.AuthType
 	buf[1] = h.PayloadType
@@ -101,7 +118,30 @@ func (h ipmiSessionHeader) pack() []byte {
 	return buf
 }
 
-// buildRMCPPacket builds a complete RMCP+ packet
+// buildIPMI15Packet builds an IPMI 1.5 format packet (for pre-session)
+func buildIPMI15Packet(sessionID uint32, sequence uint32, payload []byte) []byte {
+	rmcp := rmcpHeader{
+		Version:  rmcpVersion,
+		Reserved: 0,
+		Sequence: rmcpSequence,
+		Class:    rmcpClassIPMI,
+	}
+
+	session := ipmi15SessionHeader{
+		AuthType:   ipmiAuthNone,
+		Sequence:   sequence,
+		SessionID:  sessionID,
+		PayloadLen: uint8(len(payload)),
+	}
+
+	packet := make([]byte, 0, 4+10+len(payload))
+	packet = append(packet, rmcp.pack()...)
+	packet = append(packet, session.pack()...)
+	packet = append(packet, payload...)
+	return packet
+}
+
+// buildRMCPPacket builds a complete RMCP+ (IPMI 2.0) packet
 func buildRMCPPacket(authType uint8, payloadType uint8, sessionID uint32, sequence uint32, payload []byte) []byte {
 	rmcp := rmcpHeader{
 		Version:  rmcpVersion,
@@ -110,7 +150,7 @@ func buildRMCPPacket(authType uint8, payloadType uint8, sessionID uint32, sequen
 		Class:    rmcpClassIPMI,
 	}
 
-	session := ipmiSessionHeader{
+	session := ipmi20SessionHeader{
 		AuthType:    authType,
 		PayloadType: payloadType,
 		SessionID:   sessionID,

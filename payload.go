@@ -61,7 +61,7 @@ func (s *Session) activateSOL(ctx context.Context) error {
 	data := []byte{
 		solPayloadType, // Payload type = SOL
 		0x01,           // Payload instance = 1
-		0xC0,           // Aux data byte 1: enable encryption/authentication based on session
+		0x00,           // Aux data byte 1: no special options
 		0x00,           // Aux data byte 2
 		0x00,           // Aux data byte 3
 		0x00,           // Aux data byte 4
@@ -76,25 +76,25 @@ func (s *Session) activateSOL(ctx context.Context) error {
 	}
 
 	// Parse Activate Payload response
-	if len(resp) < 28 {
+	// RMCP(4) + Session(12) + IPMI header (6) + completion code (1) + data
+	if len(resp) < 30 {
 		return fmt.Errorf("activate payload response too short: %d", len(resp))
 	}
 
-	// Extract response data - skip headers, find completion code
-	// Response includes: aux data (4), inbound payload size (2), outbound payload size (2), port (2)
-	respData := resp[20:]
-	if len(respData) < 12 {
-		return fmt.Errorf("activate payload data too short")
-	}
-
-	// Check completion code (first byte after message header in response)
-	cc := resp[19] // Completion code position varies
+	// Completion code is at offset 22: RMCP(4) + Session(12) + rsAddr(1) + netFn(1) + chk(1) + rqAddr(1) + rqSeq(1) + cmd(1) = 22
+	cc := resp[22]
 	if cc != 0x00 {
 		return fmt.Errorf("activate payload failed: completion code 0x%02X", cc)
 	}
 
-	// Store max outbound payload size
-	s.maxOutbound = binary.LittleEndian.Uint16(respData[4:6])
+	// Response data starts after completion code (offset 23)
+	// aux data (4), inbound payload size (2), outbound payload size (2), port (2)
+	respData := resp[23:]
+
+	// Store max outbound payload size (at offset 6 in response data)
+	if len(respData) >= 8 {
+		s.maxOutbound = binary.LittleEndian.Uint16(respData[6:8])
+	}
 	if s.maxOutbound == 0 || s.maxOutbound > 255 {
 		s.maxOutbound = 200 // Default safe value
 	}
@@ -303,7 +303,7 @@ func (s *Session) buildSolPacket(payload []byte) []byte {
 		Class:    rmcpClassIPMI,
 	}
 
-	session := ipmiSessionHeader{
+	session := ipmi20SessionHeader{
 		AuthType:    ipmiAuthRMCPP,
 		PayloadType: payloadType,
 		SessionID:   s.remoteSessionID,

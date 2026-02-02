@@ -14,7 +14,8 @@ func (s *Session) getChannelAuthCaps(ctx context.Context) error {
 	data := []byte{0x8E, privAdmin} // Channel with IPMI v2.0 bit, requested privilege
 
 	msg := buildIPMIMessage(0x20, netFnApp, 0, 0x81, 0, 0, cmdGetChannelAuthCaps, data)
-	packet := buildRMCPPacket(ipmiAuthNone, payloadIPMI, 0, 0, msg)
+	// Use IPMI 1.5 format for pre-session messages
+	packet := buildIPMI15Packet(0, 0, msg)
 
 	resp, err := s.sendRecv(ctx, packet, 5*time.Second)
 	if err != nil {
@@ -24,7 +25,7 @@ func (s *Session) getChannelAuthCaps(ctx context.Context) error {
 	// Parse response - we mainly care that it succeeds
 	// Response contains auth types, OEM info, etc.
 	if len(resp) < 20 {
-		return fmt.Errorf("auth caps response too short")
+		return fmt.Errorf("auth caps response too short: %d bytes", len(resp))
 	}
 
 	// Check if RMCP+ is supported (byte offset depends on response format)
@@ -63,7 +64,7 @@ func (s *Session) openSession(ctx context.Context) error {
 	payload[17] = 0x00
 	payload[18] = 0x00
 	payload[19] = 0x08
-	payload[20] = integrityHmacSHA1
+	payload[20] = integrityNone // Try no integrity first
 	// payload[21:24] reserved
 
 	// Confidentiality algorithm payload
@@ -99,11 +100,12 @@ func (s *Session) openSession(ctx context.Context) error {
 		return fmt.Errorf("open session failed with status: 0x%02X", statusCode)
 	}
 
-	// Extract BMC session ID
-	s.remoteSessionID = binary.LittleEndian.Uint32(respData[4:8])
-	s.authAlg = respData[12]
-	s.integrityAlg = respData[20]
-	s.cryptoAlg = respData[28]
+	// Extract BMC session ID (Managed System Session ID is at offset 8, not 4)
+	// Offset 4 is the echo of our Console Session ID
+	s.remoteSessionID = binary.LittleEndian.Uint32(respData[8:12])
+	s.authAlg = respData[16]      // Auth payload starts at 12, algorithm at 12+4
+	s.integrityAlg = respData[24] // Integrity payload starts at 20, algorithm at 20+4
+	s.cryptoAlg = respData[32]    // Crypto payload starts at 28, algorithm at 28+4
 
 	return nil
 }
@@ -207,14 +209,17 @@ func (s *Session) closeSession(ctx context.Context) error {
 
 // buildAuthenticatedPacket builds a packet with integrity
 func (s *Session) buildAuthenticatedPacket(payloadType uint8, payload []byte) []byte {
+	// Increment session sequence
+	s.sessionSeq++
+
 	// For unauthenticated/unencrypted, just wrap normally
 	if s.integrityAlg == integrityNone {
-		return buildRMCPPacket(ipmiAuthRMCPP, payloadType, s.remoteSessionID, 0, payload)
+		return buildRMCPPacket(ipmiAuthRMCPP, payloadType, s.remoteSessionID, s.sessionSeq, payload)
 	}
 
 	// With integrity: add AuthCode trailer
 	// Payload type has authenticated bit set (0x40)
-	packet := buildRMCPPacket(ipmiAuthRMCPP, payloadType|0x40, s.remoteSessionID, 0, payload)
+	packet := buildRMCPPacket(ipmiAuthRMCPP, payloadType|0x40, s.remoteSessionID, s.sessionSeq, payload)
 
 	// Add pad and AuthCode
 	padLen := (4 - (len(payload) % 4)) % 4
