@@ -15,15 +15,15 @@ import (
 
 func main() {
 	host := flag.String("host", "", "BMC host IP address")
-	user := flag.String("user", "ADMIN", "IPMI username")
-	pass := flag.String("pass", "ADMIN", "IPMI password")
+	user := flag.String("user", "", "IPMI username")
+	pass := flag.String("pass", "", "IPMI password")
 	port := flag.Int("port", 623, "IPMI port")
 	timeout := flag.Duration("timeout", 30*time.Second, "Connection timeout")
 	verbose := flag.Bool("v", false, "Verbose output")
 	flag.Parse()
 
-	if *host == "" {
-		fmt.Fprintf(os.Stderr, "Usage: sol -host <bmc-ip> [-user USER] [-pass PASS]\n")
+	if *host == "" || *user == "" || *pass == "" {
+		fmt.Fprintf(os.Stderr, "Usage: sol -host <bmc-ip> -user <username> -pass <password>\n")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
