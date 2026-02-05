@@ -3,6 +3,7 @@ package sol
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -141,22 +142,47 @@ func (s *Session) readLoop() {
 	}()
 
 	buf := make([]byte, 1024)
+	logInterval := time.NewTicker(60 * time.Second)
+	defer logInterval.Stop()
+	var totalReads, totalTimeouts, totalPackets, totalSOL, totalData int64
+
+	s.logf("readLoop started for %s:%d", s.host, s.port)
+
 	for {
 		select {
 		case <-s.done:
 			close(queue)
 			<-done
 			return
+		case <-logInterval.C:
+			s.logf("readLoop stats for %s: reads=%d timeouts=%d packets=%d sol=%d data=%d",
+				s.host, totalReads, totalTimeouts, totalPackets, totalSOL, totalData)
 		default:
 		}
 
 		s.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		n, err := s.conn.Read(buf)
+		totalReads++
 		if err != nil {
-			// Timeout is normal, continue
+			// Timeout is normal - check inactivity
 			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+				totalTimeouts++
+				if s.inactivityTimeout > 0 {
+					last := time.Unix(0, s.lastRecvTime.Load())
+					if time.Since(last) > s.inactivityTimeout {
+						s.logf("readLoop inactivity timeout for %s (last recv %v ago)", s.host, time.Since(last))
+						select {
+						case s.errCh <- errors.New("SOL inactivity timeout"):
+						default:
+						}
+						close(queue)
+						<-done
+						return
+					}
+				}
 				continue
 			}
+			s.logf("readLoop error for %s: %v", s.host, err)
 			select {
 			case s.errCh <- err:
 			default:
@@ -166,8 +192,10 @@ func (s *Session) readLoop() {
 			return
 		}
 
+		totalPackets++
+
 		if n < 20 {
-			continue // Too short
+			continue // Too short for SOL, but BMC responded
 		}
 
 		// Check if this is a SOL packet
@@ -176,6 +204,9 @@ func (s *Session) readLoop() {
 		if payloadType != solPayloadType {
 			continue // Not SOL data
 		}
+		totalSOL++
+		// SOL packet received - session is alive
+		s.lastRecvTime.Store(time.Now().UnixNano())
 
 		// Get payload length from session header (offset 14-15, little endian)
 		payloadLen := int(binary.LittleEndian.Uint16(buf[14:16]))
@@ -199,6 +230,7 @@ func (s *Session) readLoop() {
 		// Extract character data (payload minus 4-byte SOL header)
 		dataLen := payloadLen - 4
 		if dataLen > 0 {
+			totalData++
 			data := make([]byte, dataLen)
 			copy(data, buf[20:20+dataLen])
 
@@ -209,8 +241,6 @@ func (s *Session) readLoop() {
 			select {
 			case queue <- data:
 			default:
-				// Queue full - this shouldn't happen with 10000 buffer
-				// but if it does, we still don't block
 			}
 		} else if header.PacketSeq != 0 {
 			// ACK-only packet from BMC, send our ACK
@@ -305,6 +335,41 @@ func (s *Session) sendSolAck() error {
 	s.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 	_, err := s.conn.Write(packet)
 	return err
+}
+
+// keepaliveLoop periodically sends ASF Presence Pings to detect dead BMCs.
+// The BMC responds with a Presence Pong, which readLoop picks up to update lastRecvTime.
+func (s *Session) keepaliveLoop() {
+	interval := s.inactivityTimeout / 3
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.sendPresencePing()
+		}
+	}
+}
+
+// sendPresencePing sends an ASF Presence Ping (RMCP ping).
+// This is a lightweight, unauthenticated packet that any IPMI BMC will respond to.
+func (s *Session) sendPresencePing() {
+	ping := []byte{
+		0x06, 0x00, 0xFF, 0x06, // RMCP header: version=6, reserved=0, seq=0xFF, class=ASF
+		0x00, 0x00, 0x11, 0xBE, // IANA Enterprise Number (ASF-RMCP)
+		0x80,                   // Message Type: Presence Ping
+		0x00,                   // Message Tag
+		0x00,                   // Reserved
+		0x00,                   // Data Length
+	}
+	s.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	s.conn.Write(ping)
 }
 
 // buildSolPacket builds a complete SOL packet

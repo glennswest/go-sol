@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,17 +44,26 @@ type Session struct {
 	errCh   chan error
 	done    chan struct{}
 
+	// Inactivity tracking
+	lastRecvTime      atomic.Int64 // Unix nanoseconds
+	inactivityTimeout time.Duration
+
+	// Debug logging
+	logf func(format string, args ...interface{})
+
 	mu     sync.Mutex
 	closed bool
 }
 
 // Config holds SOL connection configuration.
 type Config struct {
-	Host     string
-	Port     int // Default: 623
-	Username string
-	Password string
-	Timeout  time.Duration // Default: 30s
+	Host               string
+	Port               int           // Default: 623
+	Username           string
+	Password           string
+	Timeout            time.Duration // Default: 30s
+	InactivityTimeout  time.Duration // Default: 0 (disabled). Close session if no packets received for this duration.
+	Logf               func(format string, args ...interface{}) // Optional debug logger
 }
 
 // New creates a new SOL session (not yet connected).
@@ -64,16 +74,24 @@ func New(cfg Config) *Session {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	return &Session{
-		host:     cfg.Host,
-		port:     cfg.Port,
-		username: cfg.Username,
-		password: cfg.Password,
-		readCh:   make(chan []byte, 1000),
-		writeCh:  make(chan []byte, 100),
-		errCh:    make(chan error, 1),
-		done:     make(chan struct{}),
+	logf := cfg.Logf
+	if logf == nil {
+		logf = func(string, ...interface{}) {} // no-op
 	}
+	s := &Session{
+		host:              cfg.Host,
+		port:              cfg.Port,
+		username:          cfg.Username,
+		password:          cfg.Password,
+		inactivityTimeout: cfg.InactivityTimeout,
+		logf:              logf,
+		readCh:            make(chan []byte, 1000),
+		writeCh:           make(chan []byte, 100),
+		errCh:             make(chan error, 1),
+		done:              make(chan struct{}),
+	}
+	s.lastRecvTime.Store(time.Now().UnixNano())
+	return s
 }
 
 // Connect establishes the RMCP+ session and activates SOL.
@@ -104,6 +122,10 @@ func (s *Session) Connect(ctx context.Context) error {
 		return fmt.Errorf("RAKP handshake: %w", err)
 	}
 
+	s.logf("session params: sessionID=0x%08x remoteSessionID=0x%08x auth=%d integrity=%d crypto=%d",
+		s.sessionID, s.remoteSessionID, s.authAlg, s.integrityAlg, s.cryptoAlg)
+	s.logf("local addr: %s", s.conn.LocalAddr().String())
+
 	// Step 4: Deactivate any existing SOL session
 	s.deactivateSOL(ctx) // Ignore errors
 
@@ -113,9 +135,15 @@ func (s *Session) Connect(ctx context.Context) error {
 		return fmt.Errorf("activate SOL: %w", err)
 	}
 
+	s.logf("SOL activated: instance=%d maxOutbound=%d", s.solPayloadInstance, s.maxOutbound)
+
 	// Start read/write loops
+	s.lastRecvTime.Store(time.Now().UnixNano())
 	go s.readLoop()
 	go s.writeLoop()
+	if s.inactivityTimeout > 0 {
+		go s.keepaliveLoop()
+	}
 
 	return nil
 }

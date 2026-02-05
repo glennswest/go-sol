@@ -32,13 +32,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Connecting to %s:%d as %s...\n", *host, *port, *user)
 	}
 
-	session := sol.New(sol.Config{
+	cfg := sol.Config{
 		Host:     *host,
 		Port:     *port,
 		Username: *user,
 		Password: *pass,
 		Timeout:  *timeout,
-	})
+	}
+	if *verbose {
+		cfg.Logf = func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, "[sol] "+format+"\n", args...)
+		}
+	}
+	session := sol.New(cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 
