@@ -194,6 +194,9 @@ func (s *Session) readLoop() {
 
 		totalPackets++
 
+		// Any packet from the BMC means the session is alive
+		s.lastRecvTime.Store(time.Now().UnixNano())
+
 		if n < 20 {
 			continue // Too short for SOL, but BMC responded
 		}
@@ -202,11 +205,9 @@ func (s *Session) readLoop() {
 		// RMCP header (4) + Session header (12) + SOL header (4) + data
 		payloadType := buf[5] & 0x3F // Mask out encrypted/authenticated bits
 		if payloadType != solPayloadType {
-			continue // Not SOL data
+			continue // Not SOL data (could be IPMI response to keepalive)
 		}
 		totalSOL++
-		// SOL packet received - session is alive
-		s.lastRecvTime.Store(time.Now().UnixNano())
 
 		// Get payload length from session header (offset 14-15, little endian)
 		payloadLen := int(binary.LittleEndian.Uint16(buf[14:16]))
@@ -337,8 +338,10 @@ func (s *Session) sendSolAck() error {
 	return err
 }
 
-// keepaliveLoop periodically sends ASF Presence Pings to detect dead BMCs.
-// The BMC responds with a Presence Pong, which readLoop picks up to update lastRecvTime.
+// keepaliveLoop periodically sends authenticated IPMI commands to detect dead sessions.
+// Unlike ASF Presence Pings which bypass the RMCP+ session, this uses Get Device ID
+// over the authenticated session. If the session is dead (e.g., BMC reset after power
+// cycle), the BMC silently drops the packet and the session-level inactivity timer fires.
 func (s *Session) keepaliveLoop() {
 	interval := s.inactivityTimeout / 3
 	if interval < 10*time.Second {
@@ -352,24 +355,21 @@ func (s *Session) keepaliveLoop() {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			s.sendPresencePing()
+			s.sendSessionKeepalive()
 		}
 	}
 }
 
-// sendPresencePing sends an ASF Presence Ping (RMCP ping).
-// This is a lightweight, unauthenticated packet that any IPMI BMC will respond to.
-func (s *Session) sendPresencePing() {
-	ping := []byte{
-		0x06, 0x00, 0xFF, 0x06, // RMCP header: version=6, reserved=0, seq=0xFF, class=ASF
-		0x00, 0x00, 0x11, 0xBE, // IANA Enterprise Number (ASF-RMCP)
-		0x80,                   // Message Type: Presence Ping
-		0x00,                   // Message Tag
-		0x00,                   // Reserved
-		0x00,                   // Data Length
-	}
-	s.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	s.conn.Write(ping)
+// sendSessionKeepalive sends a Get Device ID command over the authenticated RMCP+ session.
+// If the session is still valid, the BMC responds and readLoop updates lastRecvTime.
+// If the BMC has reset (power cycle), the session ID is invalid and the packet is dropped,
+// causing the inactivity timeout to fire and trigger reconnection.
+func (s *Session) sendSessionKeepalive() {
+	// Get Device ID: netFn=App(0x06), cmd=0x01, no data
+	msg := buildIPMIMessage(0x20, netFnApp, 0, 0x81, 0, 0, 0x01, nil)
+	packet := s.buildAuthenticatedPacket(payloadIPMI, msg)
+	s.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	s.conn.Write(packet)
 }
 
 // buildSolPacket builds a complete SOL packet
