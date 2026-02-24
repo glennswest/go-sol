@@ -126,10 +126,16 @@ func (s *Session) Connect(ctx context.Context) error {
 		s.sessionID, s.remoteSessionID, s.authAlg, s.integrityAlg, s.cryptoAlg)
 	s.logf("local addr: %s", s.conn.LocalAddr().String())
 
-	// Step 4: Deactivate any existing SOL session
+	// Step 4: Set Session Privilege Level to Admin
+	if err := s.setSessionPrivilege(ctx); err != nil {
+		s.conn.Close()
+		return fmt.Errorf("set privilege: %w", err)
+	}
+
+	// Step 5: Deactivate any existing SOL session
 	s.deactivateSOL(ctx) // Ignore errors
 
-	// Step 5: Activate SOL payload
+	// Step 6: Activate SOL payload
 	if err := s.activateSOL(ctx); err != nil {
 		s.conn.Close()
 		return fmt.Errorf("activate SOL: %w", err)
@@ -194,6 +200,12 @@ func (s *Session) Close() error {
 }
 
 // Err returns any error that caused the session to fail.
+// LastRecvTime returns the time of the last packet received from the BMC,
+// including keepalive responses. This is useful for health monitoring.
+func (s *Session) LastRecvTime() time.Time {
+	return time.Unix(0, s.lastRecvTime.Load())
+}
+
 func (s *Session) Err() <-chan error {
 	return s.errCh
 }
