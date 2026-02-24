@@ -77,23 +77,31 @@ func (s *Session) activateSOL(ctx context.Context) error {
 	}
 
 	// Parse Activate Payload response
-	// RMCP(4) + Session(12) + IPMI header (6) + completion code (1) + data
-	if len(resp) < 30 {
+	// Minimum: RMCP(4) + Session(12) + IPMI msg header(6) + CC(1) = 23 bytes
+	if len(resp) < 23 {
 		return fmt.Errorf("activate payload response too short: %d", len(resp))
 	}
 
-	// Completion code is at offset 22: RMCP(4) + Session(12) + rsAddr(1) + netFn(1) + chk(1) + rqAddr(1) + rqSeq(1) + cmd(1) = 22
+	// Completion code at offset 22: RMCP(4) + Session(12) + rsAddr(1) + netFn(1) + chk(1) + rqAddr(1) + rqSeq(1) + cmd(1)
 	cc := resp[22]
 	if cc != 0x00 {
-		return fmt.Errorf("activate payload failed: completion code 0x%02X", cc)
+		extra := ""
+		switch cc {
+		case 0x80:
+			extra = " (payload already active)"
+		case 0x81:
+			extra = " (payload type disabled)"
+		}
+		return fmt.Errorf("activate payload failed: completion code 0x%02X%s (crypto=%d integrity=%d)", cc, extra, s.cryptoAlg, s.integrityAlg)
 	}
 
-	// Response data starts after completion code (offset 23)
-	// aux data (4), inbound payload size (2), outbound payload size (2), port (2)
-	respData := resp[23:]
-
-	// Store max outbound payload size (at offset 6 in response data)
-	if len(respData) >= 8 {
+	// Use PayloadLen from session header to find response data length.
+	// PayloadLen covers the full IPMI message: header(6) + CC(1) + data(N) + chk2(1) = N+8
+	// Some BMCs (Dell iDRAC) return no response data at all (PayloadLen=8, just CC + checksum).
+	payloadLen := int(binary.LittleEndian.Uint16(resp[14:16]))
+	dataLen := payloadLen - 8 // Subtract IPMI overhead (6 header + 1 CC + 1 chk2)
+	if dataLen >= 8 && len(resp) >= 23+dataLen {
+		respData := resp[23 : 23+dataLen]
 		s.maxOutbound = binary.LittleEndian.Uint16(respData[6:8])
 	}
 	if s.maxOutbound == 0 || s.maxOutbound > 255 {
@@ -108,9 +116,13 @@ func (s *Session) activateSOL(ctx context.Context) error {
 
 // deactivateSOL deactivates the SOL payload
 func (s *Session) deactivateSOL(ctx context.Context) error {
+	instance := s.solPayloadInstance
+	if instance == 0 {
+		instance = 0x01 // Default instance for pre-activation cleanup
+	}
 	data := []byte{
-		solPayloadType,       // Payload type = SOL
-		s.solPayloadInstance, // Payload instance
+		solPayloadType, // Payload type = SOL
+		instance,       // Payload instance
 		0x00, 0x00, 0x00, 0x00, // Aux data
 	}
 
